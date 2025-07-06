@@ -29,6 +29,12 @@ class IMUPublisherNode(Node):
         # Gravity compensation parameter
         self.declare_parameter('remove_gravity', False)
         
+        # Bias detection parameters
+        self.declare_parameter('auto_detect_bias', True)
+        self.declare_parameter('bias_calibration_samples', 100)  # Number of samples for bias calculation
+        self.declare_parameter('bias_calibration_timeout', 15.0)  # Max time to wait for calibration
+        self.declare_parameter('xy_motion_threshold', 0.2)  # Threshold for motion detection
+        
         # Covariance parameters - fixed or auto-calculate
         self.declare_parameter('auto_calculate_covariance', True)
         self.declare_parameter('covariance_window_size', 100)
@@ -46,6 +52,13 @@ class IMUPublisherNode(Node):
         self.sensor_freq = self.get_parameter('sensor_frequency').get_parameter_value().integer_value
         
         self.remove_gravity = self.get_parameter('remove_gravity').get_parameter_value().bool_value
+        
+        # Bias detection parameters
+        self.auto_detect_bias = self.get_parameter('auto_detect_bias').get_parameter_value().bool_value
+        self.bias_calibration_samples = self.get_parameter('bias_calibration_samples').get_parameter_value().integer_value
+        self.bias_calibration_timeout = self.get_parameter('bias_calibration_timeout').get_parameter_value().double_value
+        self.xy_motion_threshold = self.get_parameter('xy_motion_threshold').get_parameter_value().double_value
+        
         self.auto_calculate_covariance = self.get_parameter('auto_calculate_covariance').get_parameter_value().bool_value
         self.covariance_window_size = self.get_parameter('covariance_window_size').get_parameter_value().integer_value
         
@@ -53,6 +66,14 @@ class IMUPublisherNode(Node):
         self.fixed_orientation_cov = self.get_parameter('orientation_covariance').get_parameter_value().double_array_value
         self.fixed_angular_velocity_cov = self.get_parameter('angular_velocity_covariance').get_parameter_value().double_array_value
         self.fixed_linear_acceleration_cov = self.get_parameter('linear_acceleration_covariance').get_parameter_value().double_array_value
+        
+        # Bias detection state
+        self.bias_calibrated = False
+        self.bias_calibration_buffer = []
+        self.bias_x = 0.0
+        self.bias_y = 0.0
+        self.bias_z = 0.0
+        self.calibration_start_time = None
         
         # Publisher - changed to /imu to match Gazebo
         self.imu_publisher = self.create_publisher(
@@ -93,6 +114,9 @@ class IMUPublisherNode(Node):
         self.get_logger().info(f"Frame ID: {self.frame_id}, Publish rate: {self.publish_rate} Hz")
         self.get_logger().info(f"Remove gravity: {self.remove_gravity}")
         self.get_logger().info(f"Auto-calculate covariance: {self.auto_calculate_covariance}")
+        self.get_logger().info(f"Auto detect bias: {self.auto_detect_bias}")
+        if self.auto_detect_bias:
+            self.get_logger().info(f"Bias calibration: {self.bias_calibration_samples} samples, {self.bias_calibration_timeout}s timeout")
         self.get_logger().info(f"Publishing to /imu topic")
     
     def init_sensor(self) -> bool:
@@ -107,6 +131,10 @@ class IMUPublisherNode(Node):
 
                 time.sleep(1)
                 
+                # Start bias calibration if enabled
+                if self.auto_detect_bias and not self.bias_calibrated:
+                    self.start_bias_calibration()
+                
                 return True
             else:
                 self.get_logger().error("Failed to connect to WT61PC sensor")
@@ -116,221 +144,72 @@ class IMUPublisherNode(Node):
             self.get_logger().error(f"Error initializing sensor: {e}")
             return False
     
-    def _calculate_covariance(self, data_buffer) -> list:
-        """Calculate covariance from buffered data"""
-        if len(data_buffer) < 10:  # Need minimum samples
-            return [0.01, 0.01, 0.01]  # Default values
-        
-        # Convert to numpy array
-        data_array = np.array(list(data_buffer))
-        
-        # Calculate variance for each axis
-        variances = np.var(data_array, axis=0)
-        
-        # Ensure minimum variance to avoid numerical issues
-        variances = np.maximum(variances, 1e-6)
-        
-        return variances.tolist()
+    def start_bias_calibration(self):
+        """Start the bias calibration process"""
+        self.get_logger().info("Starting bias calibration. Keep robot stationary...")
+        self.bias_calibration_buffer = []
+        self.calibration_start_time = time.time()
+        self.bias_calibrated = False
     
-    def _update_covariance_buffers(self, acc, gyro, angle):
-        """Update covariance calculation buffers"""
-        if self.auto_calculate_covariance:
-            # Add new data to buffers
-            self.orientation_buffer.append([angle.X, angle.Y, angle.Z])
-            self.angular_velocity_buffer.append([gyro.X, gyro.Y, gyro.Z])
-            self.linear_acceleration_buffer.append([acc.X, acc.Y, acc.Z])
-            
-            # Calculate new covariances every 10 samples
-            if len(self.orientation_buffer) % 10 == 0:
-                self.calculated_orientation_cov = self._calculate_covariance(self.orientation_buffer)
-                self.calculated_angular_velocity_cov = self._calculate_covariance(self.angular_velocity_buffer)
-                self.calculated_linear_acceleration_cov = self._calculate_covariance(self.linear_acceleration_buffer)
+    def update_bias_calibration(self, acc, gyro):
+        """Update bias calibration with new sample"""
+        if self.bias_calibrated or not self.auto_detect_bias:
+            return
+        
+        # Check for timeout
+        if time.time() - self.calibration_start_time > self.bias_calibration_timeout:
+            self.get_logger().error("Bias calibration timeout! Using zero bias.")
+            self.bias_calibrated = True
+            return
+        
+        # Check if we have enough samples
+        if len(self.bias_calibration_buffer) >= self.bias_calibration_samples:
+            self.finalize_bias_calibration()
+            return
+        
+        # Add sample to calibration buffer
+        self.bias_calibration_buffer.append({
+            'acc_x': acc.X,
+            'acc_y': acc.Y,
+            'acc_z': acc.Z,
+            'gyro_x': gyro.X,
+            'gyro_y': gyro.Y,
+            'gyro_z': gyro.Z
+        })
+        
+        # Log progress every 20 samples
+        if len(self.bias_calibration_buffer) % 20 == 0:
+            self.get_logger().info(f"Bias calibration progress: {len(self.bias_calibration_buffer)}/{self.bias_calibration_samples}")
     
-    def _remove_gravity_from_acceleration(self, acc, angle):
-        """Remove gravity from acceleration using current orientation"""
-        if not self.remove_gravity:
-            return acc
+    def finalize_bias_calibration(self):
+        """Calculate and set the bias values"""
+        if len(self.bias_calibration_buffer) < 10:
+            self.get_logger().error("Not enough samples for bias calibration!")
+            self.bias_calibrated = True
+            return
         
-        # Convert angles to radians
-        roll_rad = math.radians(angle.X)
-        pitch_rad = math.radians(angle.Y)
-        yaw_rad = math.radians(angle.Z)
+        # Calculate mean values (bias)
+        acc_x_samples = [sample['acc_x'] for sample in self.bias_calibration_buffer]
+        acc_y_samples = [sample['acc_y'] for sample in self.bias_calibration_buffer]
+        acc_z_samples = [sample['acc_z'] for sample in self.bias_calibration_buffer]
         
-        # Create rotation matrix to transform gravity vector to IMU frame
-        # This is a simplified approach - assumes roll, pitch, yaw rotation order
-        cos_roll = math.cos(roll_rad)
-        sin_roll = math.sin(roll_rad)
-        cos_pitch = math.cos(pitch_rad)
-        sin_pitch = math.sin(pitch_rad)
-        cos_yaw = math.cos(yaw_rad)
-        sin_yaw = math.sin(yaw_rad)
+        self.bias_x = np.mean(acc_x_samples)
+        self.bias_y = np.mean(acc_y_samples)
+        self.bias_z = np.mean(acc_z_samples) - 9.8  # Remove expected gravity
         
-        # Rotation matrix (simplified for gravity removal)
-        # This rotates the gravity vector into the IMU frame
-        gravity_in_imu_frame = np.array([
-            -sin_pitch * self.gravity_vector[2],
-            sin_roll * cos_pitch * self.gravity_vector[2], 
-            cos_roll * cos_pitch * self.gravity_vector[2]
-        ])
+        # Calculate standard deviations for quality check
+        std_x = np.std(acc_x_samples)
+        std_y = np.std(acc_y_samples)
+        std_z = np.std(acc_z_samples)
         
-        # Remove gravity from acceleration
-        acc_corrected = type(acc)()
-        acc_corrected.X = acc.X - gravity_in_imu_frame[0]
-        acc_corrected.Y = acc.Y - gravity_in_imu_frame[1]
-        acc_corrected.Z = acc.Z - gravity_in_imu_frame[2]
+        self.bias_calibrated = True
         
-        return acc_corrected
-       
-    def create_imu_message(self, timestamp) -> Optional[Imu]:
-        if not self.sensor:
-            return None
-            
-        if not self.sensor.available():
-            return None
-            
-        acc, gyro, angle = self.sensor.get_all_data()
+        self.get_logger().info("=" * 50)
+        self.get_logger().info("BIAS CALIBRATION COMPLETE")
+        self.get_logger().info(f"Samples used: {len(self.bias_calibration_buffer)}")
+        self.get_logger().info(f"Detected bias - X: {self.bias_x:.4f}, Y: {self.bias_y:.4f}, Z: {self.bias_z:.4f}")
+        self.get_logger().info(f"Standard dev - X: {std_x:.4f}, Y: {std_y:.4f}, Z: {std_z:.4f}")
         
-        # Update covariance buffers
-        self._update_covariance_buffers(acc, gyro, angle)
-        
-        # Remove gravity if requested
-        acc_processed = self._remove_gravity_from_acceleration(acc, angle)
-        
-        # Create IMU message
-        imu_msg = Imu()
-        
-        # Header
-        imu_msg.header = Header()
-        imu_msg.header.stamp = timestamp
-        imu_msg.header.frame_id = self.frame_id
-        
-        # Linear acceleration (gravity removed if requested)
-        imu_msg.linear_acceleration.x = acc_processed.X
-        imu_msg.linear_acceleration.y = acc_processed.Y
-        imu_msg.linear_acceleration.z = acc_processed.Z
-        
-        # Angular velocity (convert to rad/s)
-        imu_msg.angular_velocity.x = math.radians(gyro.X)
-        imu_msg.angular_velocity.y = math.radians(gyro.Y)
-        imu_msg.angular_velocity.z = math.radians(gyro.Z)
-        
-        # Orientation (convert to quaternion)
-        roll_rad = math.radians(angle.X)
-        pitch_rad = math.radians(angle.Y) 
-        yaw_rad = math.radians(angle.Z)
-        
-        quat_array = quaternion_from_euler(roll_rad, pitch_rad, yaw_rad)
-        
-        imu_msg.orientation.x = quat_array[0]
-        imu_msg.orientation.y = quat_array[1]
-        imu_msg.orientation.z = quat_array[2]
-        imu_msg.orientation.w = quat_array[3]
-
-        # Covariance matrices
-        if self.auto_calculate_covariance:
-            # Use calculated covariances
-            orientation_cov = self.calculated_orientation_cov
-            angular_velocity_cov = self.calculated_angular_velocity_cov
-            linear_acceleration_cov = self.calculated_linear_acceleration_cov
-        else:
-            # Use fixed covariances
-            orientation_cov = self.fixed_orientation_cov
-            angular_velocity_cov = self.fixed_angular_velocity_cov
-            linear_acceleration_cov = self.fixed_linear_acceleration_cov
-        
-        # 3x3 covariance matrices (flattened to 9 elements)
-        imu_msg.orientation_covariance = [
-            orientation_cov[0], 0.0, 0.0,
-            0.0, orientation_cov[1], 0.0,
-            0.0, 0.0, orientation_cov[2]
-        ]
-        
-        imu_msg.angular_velocity_covariance = [
-            angular_velocity_cov[0], 0.0, 0.0,
-            0.0, angular_velocity_cov[1], 0.0,
-            0.0, 0.0, angular_velocity_cov[2]
-        ]
-        
-        imu_msg.linear_acceleration_covariance = [
-            linear_acceleration_cov[0], 0.0, 0.0,
-            0.0, linear_acceleration_cov[1], 0.0,
-            0.0, 0.0, linear_acceleration_cov[2]
-        ]
-        
-        return imu_msg
-    
-    def timer_callback(self):
-        try:
-            timestamp = self.get_clock().now().to_msg()
-            
-            imu_msg = self.create_imu_message(timestamp)
-            
-            if imu_msg is not None:
-                self.imu_publisher.publish(imu_msg)
-                
-                self.consecutive_failures = 0
-                
-                # Optional: Log data periodically
-                # if self.get_clock().now().nanoseconds % 1000000000 < 50000000:
-                #     acc, gyro, angle = self.sensor.get_all_data()
-                #     self.get_logger().info(
-                #         f"IMU Data - Acc: ({acc.X:.2f}, {acc.Y:.2f}, {acc.Z:.2f}), "
-                #         f"Gyro: ({gyro.X:.2f}, {gyro.Y:.2f}, {gyro.Z:.2f}), "
-                #         f"Angle: ({angle.X:.2f}, {angle.Y:.2f}, {angle.Z:.2f})"
-                #     )
-            else:
-                self.consecutive_failures += 1
-                if self.consecutive_failures % 50 == 0:
-                    self.get_logger().warn(f"No IMU data available ({self.consecutive_failures} failures)")
-                
-                if self.consecutive_failures >= self.max_failures:
-                    self.get_logger().error("Too many consecutive failures, attempting to reconnect...")
-                    self.reconnect_sensor()
-                    
-        except Exception as e:
-            self.get_logger().error(f"Error in timer callback: {e}")
-            self.consecutive_failures += 1
-    
-    def reconnect_sensor(self):
-        try:
-            if self.sensor:
-                self.sensor.disconnect()
-            
-            self.get_logger().info("Attempting to reconnect to sensor...")
-            if self.init_sensor():
-                self.consecutive_failures = 0
-                self.get_logger().info("Successfully reconnected to sensor")
-            else:
-                self.get_logger().error("Failed to reconnect to sensor")
-                
-        except Exception as e:
-            self.get_logger().error(f"Error during reconnection: {e}")
-    
-    def destroy_node(self):
-        if self.sensor:
-            self.sensor.disconnect()
-            self.get_logger().info("Disconnected from WT61PC sensor")
-        super().destroy_node()
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    try:
-        imu_node = IMUPublisherNode()
-        rclpy.spin(imu_node)
-
-    except KeyboardInterrupt:
-        print("\nKeyboard interrupt received, shutting down...")
-
-    except Exception as e:
-        print(f"Error in main: {e}")
-        
-    finally:
-        if 'imu_node' in locals():
-            imu_node.destroy_node()
-        
-        rclpy.shutdown()
-        print("IMU Publisher Node shutdown complete")
-
-if __name__ == '__main__':
-    main()
+        # Quality check
+        if std_x > 0.1 or std_y > 0.1 or std_z > 0.1:
+            self.
