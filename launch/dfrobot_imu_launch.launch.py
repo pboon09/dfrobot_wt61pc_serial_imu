@@ -5,8 +5,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='dfrobot_wt61pc_serial_imu',
-            executable='imu_publisher',
-            name='imu_publisher',
+            executable='dfrobot_imu_publisher.py',
+            name='dfrobot_imu_publisher',
             parameters=[{
                 'port': '/dev/ttyUSB0',
                 'baudrate': 9600,
