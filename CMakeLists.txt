@@ -28,8 +28,8 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   scripts/dummy_script.py
-  scripts/imu_publisher_node.py
-  scripts/imu_check_data_node.py
+  scripts/dfrobot_imu_publisher.py
+  scripts/imu_data_checker.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -50,6 +50,7 @@ install(TARGETS
 ################ INSTALL LAUNCH, ETC #################
 install(DIRECTORY
   # add directories here
+  launch
   DESTINATION share/${PROJECT_NAME})
 
 ament_package()

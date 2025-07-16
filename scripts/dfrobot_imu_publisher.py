@@ -15,9 +15,9 @@ from tf_transformations import quaternion_from_euler
 
 from dfrobot_wt61pc_serial_imu.dfrobot_wt61pc_serial_imu import DFRobotWT61PC, FrequencyConstants
 
-class IMUPublisherNode(Node): 
+class DFRobotIMUPublisher(Node): 
     def __init__(self):
-        super().__init__('imu_publisher_node')
+        super().__init__('dfrobot_imu_publisher')
         
         # Declare parameters
         self.declare_parameter('port', '/dev/ttyUSB0')
@@ -448,7 +448,7 @@ class IMUPublisherNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     try:
-        imu_node = IMUPublisherNode()
+        imu_node = DFRobotIMUPublisher()
         rclpy.spin(imu_node)
 
     except KeyboardInterrupt:

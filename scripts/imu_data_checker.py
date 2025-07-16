@@ -10,9 +10,9 @@ from sensor_msgs.msg import Imu
 from tf_transformations import euler_from_quaternion
 
 
-class IMUCheckDataNode(Node):
+class IMUDataCheckerNode(Node):
     def __init__(self):
-        super().__init__('imu_check_data_node')
+        super().__init__('imu_data_checker')
         
         # Parameters
         self.declare_parameter('display_rate', 10.0)  # Hz - how often to print data
@@ -219,7 +219,7 @@ class IMUCheckDataNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     try:
-        imu_check_node = IMUCheckDataNode()
+        imu_check_node = IMUDataCheckerNode()
         rclpy.spin(imu_check_node)
 
     except KeyboardInterrupt:
